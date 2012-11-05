@@ -30,6 +30,8 @@ module System.Remote.Monitoring
     , serverThreadId
     , forkServer
 
+    , monitor
+
       -- * User-defined counters, gauges, and labels
       -- $userdefined
     , getCounter
@@ -37,15 +39,16 @@ module System.Remote.Monitoring
     , getLabel
     ) where
 
-import Control.Applicative ((<$>), (<|>))
+import Control.Applicative ((<$>))
 import Control.Concurrent (ThreadId, forkIO)
-import Control.Monad (forM, join, unless)
+import Control.Monad (forM)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.Aeson.Encode as A
 import Data.Aeson.Types ((.=))
 import qualified Data.Aeson.Types as A
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Char8 as S8
+import qualified Data.ByteString.Lazy.Char8 as LS8
 import Data.Function (on)
 import qualified Data.HashMap.Strict as M
 import Data.IORef (IORef, atomicModifyIORef, newIORef, readIORef)
@@ -53,20 +56,18 @@ import qualified Data.List as List
 import qualified Data.Map as Map
 import Data.Maybe (listToMaybe)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word8)
 import qualified GHC.Stats as Stats
-import Paths_ekg (getDataDir)
-import Prelude hiding (read)
-import Snap.Core (MonadSnap, Request, Snap, finishWith, getHeaders, getRequest,
-                  getResponse, method, Method(GET), modifyResponse, pass, route,
-                  rqParams, rqPathInfo, setContentType, setResponseStatus,
-                  writeBS, writeLBS)
-import Snap.Http.Server (httpServe)
-import qualified Snap.Http.Server.Config as Config
-import Snap.Util.FileServe (serveDirectory)
-import System.FilePath ((</>))
+import Paths_ekg_wai (getDataDir)
+import Prelude hiding (read, FilePath)
+import Filesystem.Path ( (</>) )
+import Filesystem.Path.CurrentOS ( decodeString )
+import Network.HTTP.Types.Status ( status200, status404 )
+import Network.Wai ( Application, Request(..), Response(..), responseLBS )
+import Network.Wai.Middleware.Route ( dispatch, mkRoutes', Rule(Get) )
+import Network.Wai.Application.Static ( staticApp, defaultWebAppSettings )
+import Network.Wai.Handler.Warp ( runSettings, defaultSettings, settingsPort, settingsHost, HostPreference )
 
 import System.Remote.Counter (Counter)
 import qualified System.Remote.Counter.Internal as Counter
@@ -230,13 +231,18 @@ serverThreadId = threadId
 -- setting the Accept header.  At the moment three content types are
 -- available: \"application\/json\", \"text\/html\", and
 -- \"text\/plain\".
-forkServer :: S.ByteString  -- ^ Host to listen on (e.g. \"localhost\")
+forkServer :: HostPreference  -- ^ Host to listen on (e.g. \"localhost\")
            -> Int           -- ^ Port to listen on (e.g. 8000)
            -> IO Server
 forkServer host port = do
     counters <- newIORef M.empty
     gauges <- newIORef M.empty
     labels <- newIORef M.empty
+    tid <- forkIO $ runSettings conf (monitor counters gauges labels)
+    return $! Server tid counters gauges labels
+  where
+  conf = defaultSettings { settingsPort=port, settingsHost=host }
+    {-
     tid <- forkIO $ httpServe conf (monitor counters gauges labels)
     return $! Server tid counters gauges labels
   where conf = Config.setVerbose False $
@@ -245,6 +251,7 @@ forkServer host port = do
                Config.setPort port $
                Config.setHostname host $
                Config.defaultConfig
+               -}
 
 ------------------------------------------------------------------------
 -- * User-defined counters, gauges and labels
@@ -444,43 +451,47 @@ instance A.ToJSON Group where
 ------------------------------------------------------------------------
 -- * HTTP request handler
 
--- | A handler that can be installed into an existing Snap application.
-monitor :: IORef Counters -> IORef Gauges -> IORef Labels -> Snap ()
-monitor counters gauges labels = do
-    dataDir <- liftIO getDataDir
-    route [
-          ("", method GET (format "application/json"
-                           (serveAll counters gauges labels)))
-        , ("combined", method GET (format "application/json"
-                                   (serveCombined counters gauges labels)))
-        , ("counters", method GET (format "application/json"
-                                   (serveMany counters)))
-        , ("counters/:name", method GET (format "text/plain"
-                                         (serveOne counters)))
-        , ("gauges", method GET (format "application/json"
-                                 (serveMany gauges)))
-        , ("gauges/:name", method GET (format "text/plain"
-                                       (serveOne gauges)))
-        , ("labels", method GET (format "application/json"
-                                 (serveMany labels)))
-        , ("labels/:name", method GET (format "text/plain"
-                                       (serveOne labels)))
-        ]
-        <|> serveDirectory (dataDir </> "assets")
+-- | A handler that can be installed into an existing WAI application.
+monitor :: IORef Counters -> IORef Gauges -> IORef Labels -> Application
+monitor counters gauges labels req = do
+    let js = format "application/json"
+    let pl = format "text/plain"
+    let routes = mkRoutes'
+          [ Get ""           $ js (serveAll counters gauges labels)
+          , Get "combined"   $ js (serveCombined counters gauges labels)
+          , Get "counters"   $ js (serveMany counters)
+          , Get "counters/#" $ pl (serveOne counters)
+          , Get "gauges"     $ js (serveMany gauges)
+          , Get "gauges/#"   $ pl (serveOne gauges)
+          , Get "labels"     $ js (serveMany labels)
+          , Get "labels/#"   $ pl (serveOne labels)
+          , Get "*"          $ static
+          ] 
+    dispatch True routes e404 req
+
+static :: Application
+static req = do
+    let r' = case pathInfo req of
+              [] -> req { pathInfo = ["index.html"] }
+              _ -> req
+    dataDir <- (</> "assets") . decodeString <$> liftIO getDataDir
+    staticApp (defaultWebAppSettings dataDir) r'
 
 -- | The Accept header of the request.
-acceptHeader :: Request -> Maybe S.ByteString
-acceptHeader req = S.intercalate "," <$> getHeaders "Accept" req
+acceptHeader :: Request -> S.ByteString
+acceptHeader req = S.intercalate "," accepts
+  where
+  accepts = map snd $ filter (\(k,_v) -> k=="Accept") 
+                             (requestHeaders req)
 
--- | Runs a Snap monad action only if the request's Accept header
+-- | Runs a WAI Application only if the request's Accept header
 -- matches the given MIME type.
-format :: MonadSnap m => S.ByteString -> m a -> m a
-format fmt action = do
-    req <- getRequest
-    let acceptHdr = (List.head . parseHttpAccept) <$> acceptHeader req
-    case acceptHdr of
-        Just hdr | hdr == fmt -> action
-        _ -> pass
+format :: S.ByteString -> Application -> Application
+format fmt action req = do
+    let acceptHdr = (List.head . parseHttpAccept) $ acceptHeader req
+    if acceptHdr == fmt
+      then action req
+      else static req
 
 -- | Get a snapshot of all values.  Note that we're not guaranteed to
 -- see a consistent snapshot of the whole map.
@@ -493,13 +504,18 @@ readAllRefs mapRef = do
         return (name, Json val)
 {-# INLINABLE readAllRefs #-}
 
+respondJSON :: A.ToJSON a => a -> Response
+respondJSON js =
+  responseLBS status200
+                  [("Content-Type", "application/json")]
+                  (A.encode $ A.toJSON js)
+
 -- | Serve a collection of counters or gauges, as a JSON object.
-serveMany :: (Ref r t, A.ToJSON t) => IORef (M.HashMap T.Text r) -> Snap ()
-serveMany mapRef = do
+serveMany :: (Ref r t, A.ToJSON t) => IORef (M.HashMap T.Text r) -> Application
+serveMany mapRef _req = do
     list <- liftIO $ readAllRefs mapRef
-    modifyResponse $ setContentType "application/json"
     time <- liftIO getTimeMillis
-    writeLBS $ A.encode $ A.toJSON $ Group list time
+    return (respondJSON $ Group list time)
 {-# INLINABLE serveMany #-}
 
 getGcStats :: IO Stats.GCStats
@@ -515,60 +531,54 @@ getGcStats = do
 
 -- | Serve all counter, gauges and labels, built-in or not, as a
 -- nested JSON object.
-serveAll :: IORef Counters -> IORef Gauges -> IORef Labels -> Snap ()
-serveAll counters gauges labels = do
-    req <- getRequest
-    -- Workaround: Snap still matches requests to /foo to this handler
-    -- if the Accept header is "application/json", even though such
-    -- requests ought to go to the 'serveOne' handler.
-    unless (S.null $ rqPathInfo req) pass
-    modifyResponse $ setContentType "application/json"
+serveAll :: IORef Counters -> IORef Gauges -> IORef Labels -> Application
+serveAll counters gauges labels _req = do
     gcStats <- liftIO getGcStats
     counterList <- liftIO $ readAllRefs counters
     gaugeList <- liftIO $ readAllRefs gauges
     labelList <- liftIO $ readAllRefs labels
     time <- liftIO getTimeMillis
-    writeLBS $ A.encode $ A.toJSON $ Stats gcStats counterList gaugeList
-        labelList time
+    return (respondJSON $ Stats gcStats counterList gaugeList labelList time)
 
 -- | Serve all counters and gauges, built-in or not, as a flattened
 -- JSON object.
-serveCombined :: IORef Counters -> IORef Gauges -> IORef Labels -> Snap ()
-serveCombined counters gauges labels = do
-    modifyResponse $ setContentType "application/json"
+serveCombined :: IORef Counters -> IORef Gauges -> IORef Labels -> Application
+serveCombined counters gauges labels _req = do
     gcStats <- liftIO getGcStats
     counterList <- liftIO $ readAllRefs counters
     gaugeList <- liftIO $ readAllRefs gauges
     labelList <- liftIO $ readAllRefs labels
     time <- liftIO getTimeMillis
-    writeLBS $ A.encode $ A.toJSON $ Combined $
-        Stats gcStats counterList gaugeList labelList time
+    return ( respondJSON
+           $ Combined $ Stats gcStats counterList gaugeList labelList time)
 
 -- | Serve a single counter, as plain text.
-serveOne :: (Ref r t, Show t) => IORef (M.HashMap T.Text r) -> Snap ()
-serveOne refs = do
-    modifyResponse $ setContentType "text/plain"
+serveOne :: (Ref r t, Show t) => IORef (M.HashMap T.Text r) -> Application
+serveOne refs req = do
     m <- liftIO $ readIORef refs
-    req <- getRequest
-    let mname = T.decodeUtf8 <$> join
-                (listToMaybe <$> Map.lookup "name" (rqParams req))
-    case mname of
-        Nothing -> pass
-        Just name -> case M.lookup name m of
-            Just counter -> do
-                val <- liftIO $ read counter
-                writeBS $ S8.pack $ show val
-            Nothing ->
-                -- Try built-in (e.g. GC) refs
-                case Map.lookup name builtinCounters of
-                    Just f -> do
-                        gcStats <- liftIO getGcStats
-                        writeBS $ S8.pack $ f gcStats
-                    Nothing -> do
-                        modifyResponse $ setResponseStatus 404 "Not Found"
-                        r <- getResponse
-                        finishWith r
+    mVal <- case listToMaybe $ reverse $ pathInfo req of
+      Nothing -> error "foo"
+      Just name -> case M.lookup name m of
+          Just counter -> do
+              val <- liftIO $ read counter
+              return $ Just $ LS8.pack $ show val
+          Nothing ->
+              -- Try built-in (e.g. GC) refs
+              case Map.lookup name builtinCounters of
+                  Just f -> do
+                      gcStats <- liftIO getGcStats
+                      return $ Just $ LS8.pack $ f gcStats
+                  Nothing -> return Nothing
+
+    case mVal of
+      Just lbs ->
+        return $ responseLBS status200 [("Content-Type", "text/plain")] lbs
+      Nothing ->
+        e404 req
+
 {-# INLINABLE serveOne #-}
+e404 :: Application
+e404 _req = return $ responseLBS status404 [("Content-Type", "text/plain")] "not found"
 
 -- | A list of all built-in (e.g. GC) counters, together with a
 -- pretty-printing function for each.
@@ -669,3 +679,4 @@ breakDiscard w s =
 -- | Return the number of milliseconds since epoch.
 getTimeMillis :: IO Double
 getTimeMillis = (realToFrac . (* 1000)) `fmap` getPOSIXTime
+

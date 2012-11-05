@@ -1,15 +1,14 @@
-name:                ekg
-version:             0.3.1.2
-synopsis:            Remote monitoring of processes
+name:                ekg-wai
+version:             0.1
+synopsis:            Remote monitoring of processes, for WAI
 description:
-  This library lets you remotely monitor a running process over HTTP.
-  It provides a simple way to integrate a monitoring server into any
-  application.
-homepage:            https://github.com/tibbe/ekg
+  This is a fork of Tibell's ekg package, written to run under WAI instead of
+  Snap
+homepage:            https://github.com/tsuraan/ekg-wai
 license:             BSD3
 license-file:        LICENSE
 author:              Johan Tibell
-maintainer:          johan.tibell@gmail.com
+maintainer:          tsuraan@gmail.com
 category:            System, Network
 build-type:          Simple
 cabal-version:       >=1.6
@@ -27,7 +26,7 @@ library
                        System.Remote.Label
                        System.Remote.Monitoring
 
-  other-modules:       Paths_ekg
+  other-modules:       Paths_ekg_wai
                        System.Remote.Counter.Internal
                        System.Remote.Gauge.Internal
                        System.Remote.Label.Internal
@@ -37,14 +36,18 @@ library
                        bytestring < 1.0,
                        containers < 0.6,
                        filepath < 1.4,
-                       snap-core < 0.10,
-                       snap-server < 0.10,
                        text < 0.12,
                        time < 1.5,
                        transformers < 0.4,
-                       unordered-containers < 0.3
+                       unordered-containers < 0.3,
+                       wai < 1.4,
+                       wai-middleware-route < 0.8,
+                       wai-app-static < 1.4,
+                       http-types,
+                       system-filepath,
+                       warp
   ghc-options:         -Wall
 
 source-repository head
   type:     git
-  location: https://github.com/tibbe/ekg.git
+  location: https://github.com/tsuraan/ekg-wai.git

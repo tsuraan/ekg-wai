@@ -9,13 +9,14 @@ import Control.Exception
 import qualified System.Remote.Counter as Counter
 import qualified System.Remote.Label as Label
 import System.Remote.Monitoring
+import Network.Wai.Handler.Warp ( HostPreference(HostAny) )
 
 mean :: Fractional a => [a] -> a
 mean xs = sum xs / fromIntegral (length xs)
 
 main :: IO ()
 main = do
-    handle <- forkServer "localhost" 8000
+    handle <- forkServer HostAny 8000
     counter <- getCounter "iterations" handle
     label <- getLabel "args" handle
     Label.set label "some text string"
