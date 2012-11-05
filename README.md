@@ -43,3 +43,5 @@ Master [git repository](https://github.com/tibbe/ekg):
 
 This library is written and maintained by Johan Tibell,
 <johan.tibell@gmail.com>.
+
+WAI modifications were done by Jay, <tsuran@gmail.com>.
